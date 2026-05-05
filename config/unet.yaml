@@ -1,0 +1,21 @@
+#data
+dataset_name: license_plates
+train_data_path: data/license_plates_synth/train
+val_data_path: data/license_plates_synth/val
+batch_size: 48
+resume: #filepath do postojeceg modela pokazuje tocno na model.pth file npt /checkpoints/model.pth
+
+#training
+device: cuda
+num_workers: 4
+lr: 0.0001
+epochs: 100
+stopping_patience: 20
+checkpoint_path: checkpoints/model.pth #for fine-tuning else put none
+
+#model
+encoder_name: resnet34
+encoder_weights: imagenet
+in_channels: 4
+num_classes: 3
+checkpoint_path: None
