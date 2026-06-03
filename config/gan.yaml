@@ -15,6 +15,11 @@ spatial_discounting_gamma: 0.9
 random_crop: True
 mask_type: hole     # hole | mosaic
 mosaic_unit_size: 12
+random_color_flag: True   # True: generate random corruption | False: sample from mask_colors
+mask_colors:
+  - [0, 0, 0]
+  - [255, 255, 255]
+epoch_visualization_timing: end   # start | end | both | none
 
 # training parameters
 expname: benchmark

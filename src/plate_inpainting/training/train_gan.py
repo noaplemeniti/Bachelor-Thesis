@@ -2,6 +2,7 @@ import os
 import random
 import time
 import shutil
+import csv  #
 from argparse import ArgumentParser
 import sys
 from pathlib import Path
@@ -20,6 +21,8 @@ from trainer_gan import Trainer
 from data.dataset import InpaintingDataset
 from utils.tools import get_config
 from utils.logger import get_logger
+from evaluation.image_metrics import compute_image_metrics  #
+from visualization import get_random_visual_sample, save_epoch_quadrant, should_save_epoch_visual
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -28,6 +31,24 @@ parser = ArgumentParser()
 parser.add_argument('--config', type=str, default=str(PROJECT_ROOT / 'config' / 'gan.yaml'),
                     help="training configuration")
 parser.add_argument('--seed', type=int, help='manual seed')
+
+def save_gan_epoch_visual(trainer_module, dataset, device, output_dir, epoch, timing):
+    with torch.no_grad():
+        masked_image, mask, image = get_random_visual_sample(dataset, device)
+        generated_image, _ = trainer_module.inference(masked_image, mask)
+        generated_image = torch.clamp(generated_image, 0.0, 1.0)
+
+    return save_epoch_quadrant(
+        image,
+        masked_image,
+        mask,
+        generated_image,
+        output_dir,
+        epoch,
+        timing,
+        "gan",
+    )
+
 
 def main():
     args = parser.parse_args() 
@@ -48,14 +69,21 @@ def main():
         config['gpu_ids'] = device_ids
         cudnn.benchmark = True
 
-    # Configure checkpoint path
-    checkpoint_path = os.path.join('checkpoints',
-                                   config['dataset_name'],
-                                   config['mask_type'] + '_' + config['expname'])
-    if not os.path.exists(checkpoint_path):
-        os.makedirs(checkpoint_path)
-    shutil.copy(args.config, os.path.join(checkpoint_path, os.path.basename(args.config)))
-    logger = get_logger(checkpoint_path)    # get logger and configure it at the first call
+    # Configure checkpoint paths
+    checkpoint_root = PROJECT_ROOT / "checkpoints" / "GAN"
+    model_dir = checkpoint_root / "models"
+    visual_dir = checkpoint_root / "epoch_quadrants"
+    iteration_visual_dir = checkpoint_root / "iteration_visualizations"
+    metrics_dir = checkpoint_root / "metrics"
+    for output_dir in (checkpoint_root, model_dir, visual_dir, iteration_visual_dir, metrics_dir):
+        os.makedirs(output_dir, exist_ok=True)
+    shutil.copy(args.config, os.path.join(checkpoint_root, os.path.basename(args.config)))
+    logger = get_logger(checkpoint_root)    # get logger and configure it at the first call
+    metrics_path = os.path.join(metrics_dir, "gan_epoch_metrics.csv")  #
+    if not os.path.exists(metrics_path):  #
+        with open(metrics_path, "w", newline="") as metrics_file:  #
+            metrics_writer = csv.writer(metrics_file)  #
+            metrics_writer.writerow(["epoch", "iteration", "l1", "ae", "wgan_g", "wgan_d", "wgan_gp", "g", "d", "ssim", "psnr"])  #
 
     logger.info("Arguments: {}".format(args))
     # Set random seed
@@ -73,7 +101,12 @@ def main():
     try:  # for unexpected error logging
         # Load the dataset
         logger.info("Training on dataset: {}".format(config['dataset_name']))
-        train_dataset = InpaintingDataset(root_dir=config['train_data_path'])
+        train_dataset = InpaintingDataset(
+            root_dir=config['train_data_path'],
+            random_color_flag=config.get('random_color_flag', True),
+            mask_color=config.get('mask_color', (0, 0, 0)),
+            mask_colors=config.get('mask_colors'),
+        )
         # val_dataset = InpaintingDataset(data_path=config['val_data_path'])
         train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
                                                    batch_size=config['batch_size'],
@@ -104,6 +137,24 @@ def main():
         iterable_train_loader = iter(train_loader)
 
         time_count = time.time()
+        epoch_loss_keys = ['l1', 'ae', 'wgan_g', 'wgan_d', 'wgan_gp', 'g', 'd']  #
+        epoch_loss_sums = {k: 0.0 for k in epoch_loss_keys}  #
+        epoch_loss_counts = {k: 0 for k in epoch_loss_keys}  #
+        epoch_ssim_sum = 0.0  #
+        epoch_psnr_sum = 0.0  #
+        epoch_sample_count = 0  #
+        current_epoch_number = ((start_iteration - 1) // len(train_loader)) + 1
+
+        if should_save_epoch_visual(config, "start"):
+            visual_path = save_gan_epoch_visual(
+                trainer_module,
+                train_dataset,
+                device,
+                visual_dir,
+                current_epoch_number,
+                "start",
+            )
+            logger.info("Saved epoch visualization: {}".format(visual_path))
 
         for iteration in range(start_iteration, config['niter'] + 1):
             try:
@@ -115,6 +166,7 @@ def main():
             x = x.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
             ground_truth = ground_truth.to(device, non_blocking=True)
+            batch_size = ground_truth.size(0)  #
 
             ###### Forward pass ######
             compute_g_loss = iteration % config['n_critic'] == 0
@@ -146,6 +198,14 @@ def main():
                               + losses['wgan_g'] * config['gan_loss_alpha']
                 losses['g'].backward()
                 trainer_module.optimizer_g.step()
+                batch_psnr, batch_ssim = compute_image_metrics(inpainted_result.detach().cpu(), ground_truth.detach().cpu())  #
+                epoch_psnr_sum += batch_psnr * batch_size  #
+                epoch_ssim_sum += batch_ssim * batch_size  #
+                epoch_sample_count += batch_size  #
+            for k in epoch_loss_keys:  #
+                if k in losses:  #
+                    epoch_loss_sums[k] += losses[k].detach().item() * batch_size  #
+                    epoch_loss_counts[k] += batch_size  #
 
             # Log and visualization
             log_losses = ['l1', 'ae', 'wgan_g', 'wgan_d', 'wgan_gp', 'g', 'd']
@@ -171,13 +231,46 @@ def main():
                     viz_images = torch.stack([x, inpainted_result, offset_flow], dim=1)
                 viz_images = viz_images.view(-1, *list(x.size())[1:])
                 vutils.save_image(viz_images,
-                                  '%s/niter_%03d.png' % (checkpoint_path, iteration),
+                                  '%s/niter_%03d.png' % (iteration_visual_dir, iteration),
                                   nrow=3 * 4,
                                   normalize=True)
 
             # Save the model
             if iteration % config['snapshot_save_iter'] == 0:
-                trainer_module.save_model(checkpoint_path, iteration)
+                trainer_module.save_model(model_dir, iteration)
+            if iteration % len(train_loader) == 0 or iteration == config['niter']:  #
+                epoch_number = ((iteration - 1) // len(train_loader)) + 1  #
+                epoch_loss_values = [epoch_loss_sums[k] / epoch_loss_counts[k] if epoch_loss_counts[k] > 0 else None for k in epoch_loss_keys]  #
+                epoch_ssim = epoch_ssim_sum / epoch_sample_count if epoch_sample_count > 0 else None  #
+                epoch_psnr = epoch_psnr_sum / epoch_sample_count if epoch_sample_count > 0 else None  #
+                with open(metrics_path, "a", newline="") as metrics_file:  #
+                    metrics_writer = csv.writer(metrics_file)  #
+                    metrics_writer.writerow([epoch_number, iteration] + epoch_loss_values + [epoch_ssim, epoch_psnr])  #
+                epoch_loss_sums = {k: 0.0 for k in epoch_loss_keys}  #
+                epoch_loss_counts = {k: 0 for k in epoch_loss_keys}  #
+                epoch_ssim_sum = 0.0  #
+                epoch_psnr_sum = 0.0  #
+                epoch_sample_count = 0  #
+                if should_save_epoch_visual(config, "end"):
+                    visual_path = save_gan_epoch_visual(
+                        trainer_module,
+                        train_dataset,
+                        device,
+                        visual_dir,
+                        epoch_number,
+                        "end",
+                    )
+                    logger.info("Saved epoch visualization: {}".format(visual_path))
+                if iteration != config['niter'] and should_save_epoch_visual(config, "start"):
+                    visual_path = save_gan_epoch_visual(
+                        trainer_module,
+                        train_dataset,
+                        device,
+                        visual_dir,
+                        epoch_number + 1,
+                        "start",
+                    )
+                    logger.info("Saved epoch visualization: {}".format(visual_path))
 
     except Exception as e:  # for unexpected error logging
         logger.error("{}".format(e))
