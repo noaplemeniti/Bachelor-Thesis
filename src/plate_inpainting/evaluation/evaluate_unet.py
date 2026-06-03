@@ -8,14 +8,14 @@ from evaluation.image_metrics import compute_image_metrics
 from evaluation.ocr_metrics import compute_ocr_metrics
 
 """
-This script expects existing grount truth images, masks, masked images and predictions all placed in
+This script expects existing ground truth images, masks, masked images and predictions all placed in
 the test dir in subdirs names as images/; masks/; masked_images/; predictions/.
 """
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
-parser = ArgumentParser(description="Train a UNet model for license plate inpainting")
+parser = ArgumentParser(description="Evaluate a UNet model for license plate inpainting")
 parser.add_argument("--config", type=str, default=str(PROJECT_ROOT / 'config' / 'unet.yaml'),help="Path to a config file.")
 parser.add_argument("--test_data_path", type=str, help="Path to the test dataset for evaluation.")
 

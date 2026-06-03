@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import random
+from argparse import ArgumentParser
 
 def get_nonpadding_bbox(image, padding_color=(127, 127, 127), tolerance=0):
     padding_color = np.array(padding_color, dtype=np.uint8)

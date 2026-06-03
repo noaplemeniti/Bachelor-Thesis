@@ -2,36 +2,55 @@ from argparse import ArgumentParser
 from pathlib import Path
 import sys
 
-import torch
 from PIL import Image
+import torch
 from torchvision import transforms
+import tqdm
 
 PROJECT_ROOT_DIR = Path(__file__).resolve().parent.parent.parent.parent
 PACKAGE_ROOT_DIR = PROJECT_ROOT_DIR / "src" / "plate_inpainting"
 if str(PACKAGE_ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT_DIR))
 
+from training.trainer_gan import Trainer
 from utils.tools import get_config, tensor_to_pil_image
-from models.unet import get_unet
-import tqdm
 
 
-parser = ArgumentParser(description="Generate UNet predictions for license plate inpainting")
-parser.add_argument("--config", type=Path, default=PROJECT_ROOT_DIR / "config" / "unet.yaml", help="Path to a config file.")
-parser.add_argument("--model", type=Path, default=PROJECT_ROOT_DIR / "checkpoints" / "unet_model.pth", help="Path to a model file.")
+parser = ArgumentParser(description="Generate GAN predictions for license plate inpainting")
+parser.add_argument("--config", type=Path, default=PROJECT_ROOT_DIR / "config" / "gan.yaml", help="Path to a config file.")
+parser.add_argument("--model", type=Path, default=PROJECT_ROOT_DIR / "checkpoints" / "GAN" / "models", help="Path to a gen_*.pt file or a directory containing generator checkpoints.")
 parser.add_argument("--data_path", type=Path, default=PROJECT_ROOT_DIR / "data" / "license_plates_synth" / "test", help="Path to the data for generating predictions.")
+parser.add_argument("--predictions_dir_name", type=str, default="predictions", help="Name of the output predictions directory inside data_path.")
 
-def generate_unet_predictions():
+
+def resolve_generator_checkpoint(model_path):
+    if model_path.is_dir():
+        checkpoints = sorted(model_path.glob("gen_*.pt"))
+        if not checkpoints:
+            raise FileNotFoundError(f"No generator checkpoint found in: {model_path}")
+        return checkpoints[-1]
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"Generator checkpoint not found: {model_path}")
+
+    return model_path
+
+
+def generate_gan_predictions():
     args = parser.parse_args()
     config = get_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = get_unet(encoder_name=config["encoder_name"], encoder_weights=config["encoder_weights"], in_channels=config["in_channels"], num_classes=config["num_classes"]).to(device)
-    model.load_state_dict(torch.load(args.model, map_location=device))
-    model.eval()
+    config["cuda"] = device.type == "cuda"
+    config["gpu_ids"] = config.get("gpu_ids", [0])
+
+    trainer = Trainer(config).to(device)
+    generator_checkpoint = resolve_generator_checkpoint(args.model)
+    trainer.netG.load_state_dict(torch.load(generator_checkpoint, map_location=device))
+    trainer.eval()
 
     mask_dir = args.data_path / "masks"
     masked_image_dir = args.data_path / "masked_images"
-    prediction_dir = args.data_path / "predictions"
+    prediction_dir = args.data_path / args.predictions_dir_name
     prediction_dir.mkdir(parents=True, exist_ok=True)
     to_tensor = transforms.ToTensor()
 
@@ -41,7 +60,7 @@ def generate_unet_predictions():
     )
 
     with torch.no_grad():
-        for masked_image_path in tqdm.tqdm(masked_image_paths, desc="Generating predictions"):
+        for masked_image_path in tqdm.tqdm(masked_image_paths, desc="Generating GAN predictions"):
             mask_path = mask_dir / masked_image_path.name
             if not mask_path.exists():
                 print(f"Missing mask for {masked_image_path.name}")
@@ -52,13 +71,12 @@ def generate_unet_predictions():
             mask = mask.float().to(device, non_blocking=True)
             masked_image = masked_image.float().to(device, non_blocking=True)
 
-            input_tensor = torch.cat([masked_image, mask], dim=1)
-
-            prediction = model(input_tensor)
+            prediction, _ = trainer.inference(masked_image, mask)
             prediction = torch.clamp(prediction, 0.0, 1.0)
 
             prediction_image = tensor_to_pil_image(prediction.squeeze(0))
             prediction_image.save(prediction_dir / masked_image_path.name)
 
+
 if __name__ == "__main__":
-    generate_unet_predictions()
+    generate_gan_predictions()
