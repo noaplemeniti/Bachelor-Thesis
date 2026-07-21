@@ -30,7 +30,7 @@ def brush_strokes(
         tolerance=0,
         inner_margin=3,
     ):
-    # Fix python mutable default arguments evaluation bug
+
     stroke_length = stroke_length if stroke_length is not None else random.randint(20, 50)
     stroke_width = stroke_width if stroke_width is not None else random.randint(8, 32)
     stroke_count = stroke_count if stroke_count is not None else random.randint(3, 15)
@@ -56,7 +56,6 @@ def brush_strokes(
     if x_min > x_max or y_min > y_max:
         return None, None
 
-    # Generate the geometry shape using your exact loop logic
     for _ in range(stroke_count):
         x_start = np.random.randint(x_min, x_max + 1)
         y_start = np.random.randint(y_min, y_max + 1)
@@ -89,34 +88,28 @@ def brush_strokes(
     safe_region[y:y + bh, x:x + bw] = 255
     mask = cv2.bitwise_and(mask, safe_region)
 
-    # --- ADVANCED CORRUPTION LOGIC LIVES IN THE BACKFILL ENGINE ---
     masked_image = image.copy()
     
     if not random_color_flag:
-        # Fallback behavior baseline
         masked_image[mask == 255] = mask_color
     else:
         strategy_roll = random.random()
         
-        if strategy_roll < 0.40:
-            # Strategy A: Random Solid Rainbow Color
+        if strategy_roll < 0.50:
             random_solid = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
             masked_image[mask == 255] = random_solid
             
-        elif strategy_roll < 0.80:
-            # Strategy B: Per-pixel Digital Noise (TV Static)
+        else:
             noise = np.random.randint(0, 256, (h, w, 3), dtype=np.uint8)
             masked_image = np.where(mask[..., None] == 255, noise, masked_image)
             
-        else:
-            # Strategy C: Chameleon Color (Match plate average background context)
-            plate_crop = image[y_min:y_max, x_min:x_max]
-            mean_color = np.mean(plate_crop, axis=(0, 1)).astype(int) if plate_crop.size > 0 else [127, 127, 127]
-            jitter = random.randint(-25, 25)
-            chameleon_color = tuple(np.clip(mean_color + jitter, 0, 255).astype(int))
-            masked_image[mask == 255] = chameleon_color
+        #else:
+        #    plate_crop = image[y_min:y_max, x_min:x_max]
+        #    mean_color = np.mean(plate_crop, axis=(0, 1)).astype(int) if plate_crop.size > 0 else [127, 127, 127]
+        #    jitter = random.randint(-25, 25)
+        #    chameleon_color = tuple(np.clip(mean_color + jitter, 0, 255).astype(int))
+        #    masked_image[mask == 255] = chameleon_color
 
-    # Soft edge alpha blending to prevent the UNet edge-detection shortcut
     mask_blur = cv2.GaussianBlur(mask, (5, 5), 0) / 255.0
     mask_blur_3d = np.expand_dims(mask_blur, axis=2)
     

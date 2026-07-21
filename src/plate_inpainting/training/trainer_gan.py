@@ -34,7 +34,6 @@ class Trainer(nn.Module):
             self.globalD.to(self.device_ids[0])
 
     def forward(self, x, masks, ground_truth, compute_loss_g=False):
-        self.train()
         l1_loss = nn.L1Loss()
         losses = {}
         # G part

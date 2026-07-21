@@ -50,6 +50,36 @@ def save_gan_epoch_visual(trainer_module, dataset, device, output_dir, epoch, ti
     )
 
 
+def evaluate_validation_batch(trainer, batch, device, config):
+    """Compute validation metrics for one batch at the current iteration."""
+    metric_keys = ['l1', 'ae', 'wgan_g', 'wgan_d', 'wgan_gp', 'g', 'd']
+    trainer.eval()
+    x, mask, ground_truth = batch
+    x = x.to(device, non_blocking=True)
+    mask = mask.to(device, non_blocking=True)
+    ground_truth = ground_truth.to(device, non_blocking=True)
+
+    # The WGAN gradient penalty needs autograd even though no optimizer is stepped.
+    with torch.enable_grad():
+        losses, inpainted_result, _ = trainer(x, mask, ground_truth, True)
+        for key, value in losses.items():
+            if value.dim() != 0:
+                losses[key] = torch.mean(value)
+        losses['d'] = losses['wgan_d'] + losses['wgan_gp'] * config['wgan_gp_lambda']
+        losses['g'] = losses['l1'] * config['l1_loss_alpha'] \
+                      + losses['ae'] * config['ae_loss_alpha'] \
+                      + losses['wgan_g'] * config['gan_loss_alpha']
+
+    batch_psnr, batch_ssim = compute_image_metrics(
+        inpainted_result.detach().cpu(), ground_truth.detach().cpu()
+    )
+
+    trainer.train()
+    return [losses[key].detach().item() for key in metric_keys] + [
+        float(batch_ssim), float(batch_psnr)
+    ]
+
+
 def main():
     args = parser.parse_args() 
     config = get_config(args.config)
@@ -79,11 +109,16 @@ def main():
         os.makedirs(output_dir, exist_ok=True)
     shutil.copy(args.config, os.path.join(checkpoint_root, os.path.basename(args.config)))
     logger = get_logger(checkpoint_root)    # get logger and configure it at the first call
-    metrics_path = os.path.join(metrics_dir, "gan_epoch_metrics.csv")  #
+    metrics_path = os.path.join(metrics_dir, "gan_iteration_metrics.csv")
     if not os.path.exists(metrics_path):  #
         with open(metrics_path, "w", newline="") as metrics_file:  #
             metrics_writer = csv.writer(metrics_file)  #
-            metrics_writer.writerow(["epoch", "iteration", "l1", "ae", "wgan_g", "wgan_d", "wgan_gp", "g", "d", "ssim", "psnr"])  #
+            metric_names = ["l1", "ae", "wgan_g", "wgan_d", "wgan_gp", "g", "d", "ssim", "psnr"]
+            metrics_writer.writerow(
+                ["iteration"]
+                + [f"train_{name}" for name in metric_names]
+                + [f"val_{name}" for name in metric_names]
+            )
 
     logger.info("Arguments: {}".format(args))
     # Set random seed
@@ -107,17 +142,28 @@ def main():
             mask_color=config.get('mask_color', (0, 0, 0)),
             mask_colors=config.get('mask_colors'),
         )
-        # val_dataset = InpaintingDataset(data_path=config['val_data_path'])
+        val_loader = None
+        if config.get('val_data_path'):
+            val_dataset = InpaintingDataset(
+                root_dir=config['val_data_path'],
+                random_color_flag=config.get('random_color_flag', True),
+                mask_color=config.get('mask_color', (0, 0, 0)),
+                mask_colors=config.get('mask_colors'),
+            )
+            val_loader = torch.utils.data.DataLoader(
+                dataset=val_dataset,
+                batch_size=config['batch_size'],
+                shuffle=False,
+                num_workers=config['num_workers'],
+                pin_memory=cuda,
+                persistent_workers=config['num_workers'] > 0,
+            )
         train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
                                                    batch_size=config['batch_size'],
                                                    shuffle=True,
                                                    num_workers=config['num_workers'],
                                                    pin_memory=cuda,
                                                    persistent_workers=config['num_workers'] > 0)
-        # val_loader = torch.utils.data.DataLoader(dataset=val_dataset,
-        #                                           batch_size=config['batch_size'],
-        #                                           shuffle=False,
-        #                                           num_workers=config['num_workers'])
 
         # Define the trainer
         trainer = Trainer(config)
@@ -135,14 +181,9 @@ def main():
         start_iteration = trainer_module.resume(config['resume']) if config['resume'] else 1
 
         iterable_train_loader = iter(train_loader)
+        iterable_val_loader = iter(val_loader) if val_loader is not None else None
 
         time_count = time.time()
-        epoch_loss_keys = ['l1', 'ae', 'wgan_g', 'wgan_d', 'wgan_gp', 'g', 'd']  #
-        epoch_loss_sums = {k: 0.0 for k in epoch_loss_keys}  #
-        epoch_loss_counts = {k: 0 for k in epoch_loss_keys}  #
-        epoch_ssim_sum = 0.0  #
-        epoch_psnr_sum = 0.0  #
-        epoch_sample_count = 0  #
         current_epoch_number = ((start_iteration - 1) // len(train_loader)) + 1
 
         if should_save_epoch_visual(config, "start"):
@@ -157,6 +198,8 @@ def main():
             logger.info("Saved epoch visualization: {}".format(visual_path))
 
         for iteration in range(start_iteration, config['niter'] + 1):
+            if iteration == start_iteration:
+                logger.info("Starting iteration %d", iteration)
             try:
                 x, mask, ground_truth = next(iterable_train_loader)
             except StopIteration:
@@ -166,8 +209,6 @@ def main():
             x = x.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
             ground_truth = ground_truth.to(device, non_blocking=True)
-            batch_size = ground_truth.size(0)  #
-
             ###### Forward pass ######
             compute_g_loss = iteration % config['n_critic'] == 0
 
@@ -199,13 +240,26 @@ def main():
                 losses['g'].backward()
                 trainer_module.optimizer_g.step()
                 batch_psnr, batch_ssim = compute_image_metrics(inpainted_result.detach().cpu(), ground_truth.detach().cpu())  #
-                epoch_psnr_sum += batch_psnr * batch_size  #
-                epoch_ssim_sum += batch_ssim * batch_size  #
-                epoch_sample_count += batch_size  #
-            for k in epoch_loss_keys:  #
-                if k in losses:  #
-                    epoch_loss_sums[k] += losses[k].detach().item() * batch_size  #
-                    epoch_loss_counts[k] += batch_size  #
+            else:
+                batch_psnr = None
+                batch_ssim = None
+
+            if compute_g_loss:
+                train_values = [
+                    losses[key].detach().item()
+                    for key in ['l1', 'ae', 'wgan_g', 'wgan_d', 'wgan_gp', 'g', 'd']
+                ] + [float(batch_ssim), float(batch_psnr)]
+                if iterable_val_loader is not None:
+                    try:
+                        val_batch = next(iterable_val_loader)
+                    except StopIteration:
+                        iterable_val_loader = iter(val_loader)
+                        val_batch = next(iterable_val_loader)
+                    val_values = evaluate_validation_batch(trainer, val_batch, device, config)
+                else:
+                    val_values = [None] * len(train_values)
+                with open(metrics_path, "a", newline="") as metrics_file:
+                    csv.writer(metrics_file).writerow([iteration] + train_values + val_values)
 
             # Log and visualization
             log_losses = ['l1', 'ae', 'wgan_g', 'wgan_d', 'wgan_gp', 'g', 'd']
@@ -240,17 +294,6 @@ def main():
                 trainer_module.save_model(model_dir, iteration)
             if iteration % len(train_loader) == 0 or iteration == config['niter']:  #
                 epoch_number = ((iteration - 1) // len(train_loader)) + 1  #
-                epoch_loss_values = [epoch_loss_sums[k] / epoch_loss_counts[k] if epoch_loss_counts[k] > 0 else None for k in epoch_loss_keys]  #
-                epoch_ssim = epoch_ssim_sum / epoch_sample_count if epoch_sample_count > 0 else None  #
-                epoch_psnr = epoch_psnr_sum / epoch_sample_count if epoch_sample_count > 0 else None  #
-                with open(metrics_path, "a", newline="") as metrics_file:  #
-                    metrics_writer = csv.writer(metrics_file)  #
-                    metrics_writer.writerow([epoch_number, iteration] + epoch_loss_values + [epoch_ssim, epoch_psnr])  #
-                epoch_loss_sums = {k: 0.0 for k in epoch_loss_keys}  #
-                epoch_loss_counts = {k: 0 for k in epoch_loss_keys}  #
-                epoch_ssim_sum = 0.0  #
-                epoch_psnr_sum = 0.0  #
-                epoch_sample_count = 0  #
                 if should_save_epoch_visual(config, "end"):
                     visual_path = save_gan_epoch_visual(
                         trainer_module,

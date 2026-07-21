@@ -1,7 +1,13 @@
 data/*
+checkpoints/
+thesis_documents/
+final_results/
 .venv
 __pycache__/
 *.py[cod]
 checkpoints/
 *.pt
 *.pth
+.git/
+.agents/
+gan_imagenet_weights/
